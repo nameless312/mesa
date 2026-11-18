@@ -79,7 +79,11 @@ def declare_options():
 
     debug_options = []
     features_options = []
-    performance_options = []
+    performance_options = [
+        drirc_gen.DrircInt("hk_g17c_submit_batch_size", 0, 0, 64,
+          "Maximum GPU commands per kernel submission on the M5 Max "
+          "(0 uses the driver default)", c_name="g17c_submit_batch_size"),
+    ]
 
     drirc_gen.add_common_vk_options(debug_options, features_options, misc_options,
                                     valid_options=VALID_COMMON_VK_OPTIONS,

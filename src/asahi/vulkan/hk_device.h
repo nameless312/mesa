@@ -366,6 +366,7 @@ struct hk_device {
    } scratch;
 
    uint32_t perftest;
+   unsigned submit_command_limit;
 
    struct {
       struct u_rwlock lock;

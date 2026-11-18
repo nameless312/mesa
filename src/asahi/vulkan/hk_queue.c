@@ -488,19 +488,6 @@ asahi_append_fragment_attachments(struct hk_device *dev,
    }
 }
 
-/* Native AGX3 benefits from submitting ordered control streams together.
- * G13X already serializes both engines, and separate ioctls let the kernel
- * start a render while the following compute submission is prepared. This
- * matters for post-graphics query availability and its CPU round trip.
- */
-static inline unsigned
-max_commands_per_submit(struct hk_device *dev)
-{
-   return hk_drm_submit_command_limit(
-      dev->dev.chip != AGX_CHIP_G13X && !HK_PERF(dev, NOBATCH),
-      dev->dev.params.max_commands_per_submission);
-}
-
 static VkResult
 queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
                     unsigned ring_idx, struct hk_cmd_pending *pending)
@@ -609,9 +596,9 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
 
    while (commands_remaining) {
       bool first = commands_remaining == command_count;
-      bool last = commands_remaining <= max_commands_per_submit(dev);
+      bool last = commands_remaining <= dev->submit_command_limit;
 
-      unsigned count = MIN2(commands_remaining, max_commands_per_submit(dev));
+      unsigned count = MIN2(commands_remaining, dev->submit_command_limit);
       commands_remaining -= count;
 
       assert(!last || commands_remaining == 0);
@@ -1484,7 +1471,7 @@ hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
 {
    if (submit->buffer_bind_count || submit->image_bind_count ||
        submit->image_opaque_bind_count ||
-       command_count > max_commands_per_submit(dev) ||
+       command_count > dev->submit_command_limit ||
        (submit->signal_count && !kernel_cumulative) ||
        (dev->dev.debug & (AGX_DBG_SYNC | AGX_DBG_TRACE)))
       return false;
@@ -1634,9 +1621,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
       agx_chip_g17_m5(dev->dev.chip) &&
       debug_get_option_m5_chunk_timelines() &&
-      command_count > max_commands_per_submit(dev);
+      command_count > dev->submit_command_limit;
    const uint64_t point_count = chunk_timelines
-      ? 1 + (command_count - 1) / max_commands_per_submit(dev) : 1;
+      ? 1 + (command_count - 1) / dev->submit_command_limit : 1;
    if (queue->drm.timeline_value > UINT64_MAX - point_count)
       return vk_device_set_lost(&dev->vk, "Asahi queue timeline overflow");
    const uint64_t first_chunk_point = queue->drm.timeline_value + 1;
@@ -2250,7 +2237,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 
    struct hk_cmd_pending *pending = NULL;
    if (agx_chip_g17_m5(dev->dev.chip) && !dev->dev.is_virtio) {
-      unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
+      unsigned chunks = 1 + (command_count - 1) / dev->submit_command_limit;
       VkResult pin_result = hk_cmd_pending_begin(dev, submit, chunks, &pending);
       if (pin_result != VK_SUCCESS) {
          util_dynarray_fini(&payload);
@@ -2260,7 +2247,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       }
    }
    VkResult result;
-   if (command_count <= max_commands_per_submit(dev)) {
+   if (command_count <= dev->submit_command_limit) {
       if (unlikely(anatomy))
          hk_frame_anatomy_note_barriers(anatomy, payload.data, 0, payload.size);
       result =

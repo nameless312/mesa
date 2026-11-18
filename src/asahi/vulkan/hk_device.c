@@ -19,6 +19,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_compute_kick.h"
 #include "hk_descriptor_table.h"
+#include "hk_drm_render_core.h"
 #include "hk_entrypoints.h"
 #include "hk_instance.h"
 #include "hk_native_sampler.h"
@@ -1040,6 +1041,15 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
                          "Failed to get DRM device: %m");
       HK_INIT_FAIL(fail_fd, "agx-open-device", 0);
    }
+
+   dev->submit_command_limit = hk_drm_submit_command_limit(
+      dev->dev.chip != AGX_CHIP_G13X && !HK_PERF(dev, NOBATCH),
+      dev->dev.params.max_commands_per_submission);
+   /* Start processing the first few commands of a long CS2 render/compute
+    * submission while the kernel validates its remaining commands. */
+   unsigned batch_size = instance->drirc.performance.g17c_submit_batch_size;
+   if (dev->dev.chip == AGX_CHIP_G17C && batch_size)
+      dev->submit_command_limit = MIN2(dev->submit_command_limit, batch_size);
 
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
    dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
