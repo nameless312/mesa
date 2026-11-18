@@ -10280,6 +10280,18 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, m5, g17p);
    }
 
+   /* Counted loops whose trip count is only known at run time: run four
+    * iterations per loop test where the bound allows it. On M5 the loop
+    * control of a short body costs about as much as the body, and the
+    * unrolled body's loads issue together and vectorize below. */
+   if (m5 && !g18_scans &&
+       debug_get_bool_option("ASAHI_M5_UNROLL_RUNTIME_LOOPS", true)) {
+      bool unrolled = false;
+      NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, 4, 320);
+      if (unrolled)
+         agx_optimize_loop_nir(nir, m5, g17p);
+   }
+
    /* If soft fault is enabled, we can freely speculate everything. That lets us
     * peephole select and form preambles more aggressively.
     */
