@@ -305,3 +305,44 @@ TEST(M5RuntimeLoops, GuardBounds)
    EXPECT_EQ(folded_guard(TOP_TESTED, INT32_MIN + 3), (uint32_t)INT32_MIN + 1);
 }
 
+static nir_intrinsic_instr *
+first_intrinsic(nir_shader *s, nir_intrinsic_op op, unsigned skip)
+{
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == op && skip-- == 0)
+               return nir_instr_as_intrinsic(instr);
+         }
+      }
+   }
+   return NULL;
+}
+
+/* Four consecutive words read in one block become one vector load. */
+TEST(M5MergeWords, FourWords)
+{
+   nir_builder b = compute_shader("merge-words");
+   nir_def *i = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_def *base = nir_amul_imm(&b, i, 4);
+   nir_def *sum = nir_imm_int(&b, 0);
+   for (unsigned k = 0; k < 4; ++k) {
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_iadd_imm(&b, base, 4 * k)),
+                                   .align_mul = 4,
+                                   .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER));
+      sum = nir_iadd(&b, sum, v);
+   }
+   nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   EXPECT_TRUE(agx_nir_merge_global_words(b.shader));
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   nir_validate_shader(b.shader, "merge words");
+   nir_intrinsic_instr *load = first_intrinsic(b.shader, nir_intrinsic_load_global, 0);
+   ASSERT_NE(load, nullptr);
+   EXPECT_EQ(load->def.num_components, 4u);
+   EXPECT_EQ(first_intrinsic(b.shader, nir_intrinsic_load_global, 1), nullptr);
+   ralloc_free(b.shader);
+}
+
