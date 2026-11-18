@@ -10392,6 +10392,10 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, m5, g17p);
    }
 
+   if (m5 && !g18_scans &&
+       debug_get_bool_option("ASAHI_M5_POPCOUNT_IDIOM", true))
+      NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
+
    /* Absolute differences of unsigned bytes in 16-bit arithmetic. */
    if (m5 && !g18_scans &&
        debug_get_bool_option("ASAHI_M5_U8_ABSDIFF", true)) {
@@ -16705,5 +16709,12 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
+   /* Before the main optimization loop reassociates the last addition of a
+    * written-out population count into its user. */
+   if (debug_get_bool_option("ASAHI_M5_POPCOUNT_IDIOM", true)) {
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, nir, nir_opt_copy_prop);
+      NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
+   }
    agx_preprocess_nir_internal(nir, false, true, false, true, false);
 }
