@@ -87,6 +87,20 @@ hk_get_buffer_format_features(struct hk_physical_device *pdev,
    return features;
 }
 
+static uint32_t
+hk_texel_sparse_word(uint32_t map_page, enum pipe_format format)
+{
+   const unsigned bytes = util_format_get_blocksize(format);
+   if (!map_page || !util_is_power_of_two_nonzero(bytes))
+      return 0;
+   if (map_page >= (1u << (32 - AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT))) {
+      assert(!"sparse residency map outside the packed VA range");
+      return 0;
+   }
+   return (map_page << AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT) |
+          util_logbase2(bytes);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
                     const VkAllocationCallbacks *pAllocator,
@@ -210,23 +224,9 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
        * see AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET.  A non-power-of-two
        * element size (the emulated RGB32 layout) takes the raw load path,
        * which claims residency anyway, so leave the word zero for it. */
-      uint32_t sparse = 0;
-      const unsigned blocksize_B = util_format_get_blocksize(format);
-      if (buffer && buffer->sparse_map &&
-          util_is_power_of_two_nonzero(blocksize_B)) {
-         const uint64_t map_page = buffer->sparse_map->va->addr / AIL_PAGESIZE;
-         assert((buffer->sparse_map->va->addr % AIL_PAGESIZE) == 0);
-         /* The packed field leaves 28 bits for the map page.  Fail loudly
-          * rather than silently truncating if the VA layout ever outgrows it;
-          * a wrong map address would read residency from arbitrary memory. */
-         if (map_page < (1u << (32 - AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT))) {
-            sparse = (uint32_t)(map_page
-                                << AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT) |
-                     (uint32_t)util_logbase2(blocksize_B);
-         } else {
-            assert(!"sparse residency map outside the packed VA range");
-         }
-      }
+      const uint32_t sparse = hk_texel_sparse_word(
+         buffer && buffer->sparse_map ? buffer->sparse_map->va->addr / AIL_PAGESIZE : 0,
+         format);
 
       view->buffer_metadata = (struct hk_g17p_buffer_texture_metadata){
          .elements = view->vk.elements,
@@ -707,6 +707,8 @@ hk_texel_buffer_descriptor(struct hk_device *dev,
       .offset_el = offset_el,
       .address = base,
       .rgb32 = hk_texel_rgb32(format),
+      .sparse = hk_texel_sparse_word(
+         hk_sparse_map_page_for_address(dev, info->address), format),
    };
    static_assert(sizeof(metadata) == 24, "texel-buffer software descriptor ABI");
    memcpy(packed + AGX_G17P_BUFFER_TEXTURE_METADATA_OFFSET, &metadata,

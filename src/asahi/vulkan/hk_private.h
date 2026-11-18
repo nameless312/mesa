@@ -28,7 +28,9 @@
  * occupy 80 bytes and round to 96 so every array element's PBE half remains
  * 32-byte aligned. Mutable descriptors must be large enough for that member.
  */
-#define HK_MAX_DESCRIPTOR_SIZE           96
+#define HK_MAX_NATIVE_DESCRIPTOR_SIZE    96
+/* Descriptor-buffer layouts on G17C pad native records to a power of two. */
+#define HK_MAX_DESCRIPTOR_SIZE           128
 #define HK_MAX_PUSH_DESCRIPTORS          32
 #define HK_MAX_DESCRIPTOR_BUFFERS        32
 #define HK_MAX_DESCRIPTOR_SET_SIZE       (1u << 30)

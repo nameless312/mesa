@@ -133,6 +133,9 @@ struct hk_device {
    struct agx_device dev;
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
+   /* Sparse residency buffers addressable through vkGetDescriptorEXT. */
+   simple_mtx_t sparse_buffers_lock;
+   struct list_head sparse_buffers;
    /* Live buffers and image planes with a GPU virtual address of their own
     * (sparse binding, capture/replay buffers), atomic. Their memory is also
     * mapped at another address, see hk_cdm_alias_scope(). */

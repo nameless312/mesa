@@ -28,6 +28,7 @@ struct hk_buffer {
    /** One residency bit per sparse-buffer page on Gen9/Gen10 AGX3. */
    struct agx_bo *sparse_map;
    uint32_t sparse_map_entries;
+   struct list_head sparse_link;
 };
 
 /* VK_EXT_descriptor_buffer capture/replay data of a buffer */
@@ -100,6 +101,8 @@ hk_buffer_addr_range(const struct hk_buffer *buffer, uint64_t offset,
       .range = vk_buffer_range(&buffer->vk, offset, range),
    };
 }
+
+uint32_t hk_sparse_map_page_for_address(struct hk_device *dev, uint64_t address);
 
 VkResult hk_reserve_sparse_scratch(struct hk_device *dev, uint64_t size_B);
 void hk_release_sparse_scratch(struct hk_device *dev, uint64_t size_B);

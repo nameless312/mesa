@@ -1211,6 +1211,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    *pDevice = hk_device_to_handle(dev);
 
+   simple_mtx_init(&dev->sparse_buffers_lock, mtx_plain);
+   list_inithead(&dev->sparse_buffers);
    simple_mtx_init(&dev->cmd_pending_lock, mtx_plain);
    list_inithead(&dev->cmd_pending_queues);
    list_inithead(&dev->cmd_pending_failed);
@@ -1342,6 +1344,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
     * a new recording during teardown. Kernel job pins retain failed work. */
    hk_cmd_pending_finish(dev);
    simple_mtx_destroy(&dev->cmd_pending_lock);
+   simple_mtx_destroy(&dev->sparse_buffers_lock);
    hk_device_finish_vdm_slabs(dev);
    simple_mtx_destroy(&dev->vdm.lock);
 

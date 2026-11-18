@@ -218,6 +218,13 @@ hk_release_sparse_scratch(struct hk_device *dev, uint64_t size_B)
       p_atomic_add(&dev->sparse_scratch_B, -(int64_t)size_B);
 }
 
+static bool
+track_sparse_buffer(const struct hk_device *dev, const struct hk_buffer *buffer)
+{
+   return dev->dev.chip == AGX_CHIP_G17C && dev->vk.enabled_features.descriptorBuffer &&
+          buffer->sparse_map && (buffer->vk.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
                 const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer)
@@ -372,9 +379,34 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
    if (buffer->va)
       p_atomic_inc(&dev->va_alias_resources);
 
+   if (track_sparse_buffer(dev, buffer)) {
+      simple_mtx_lock(&dev->sparse_buffers_lock);
+      list_add(&buffer->sparse_link, &dev->sparse_buffers);
+      simple_mtx_unlock(&dev->sparse_buffers_lock);
+   }
+
    *pBuffer = hk_buffer_to_handle(buffer);
 
    return VK_SUCCESS;
+}
+
+uint32_t
+hk_sparse_map_page_for_address(struct hk_device *dev, uint64_t address)
+{
+   if (dev->dev.chip != AGX_CHIP_G17C || !p_atomic_read(&dev->sparse_scratch_B))
+      return 0;
+
+   uint32_t page = 0;
+   simple_mtx_lock(&dev->sparse_buffers_lock);
+   list_for_each_entry(struct hk_buffer, buffer, &dev->sparse_buffers, sparse_link) {
+      const uint64_t base = buffer->vk.device_address;
+      if (address >= base && address - base < buffer->vk.size) {
+         page = buffer->sparse_map->va->addr / AIL_PAGESIZE;
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->sparse_buffers_lock);
+   return page;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -388,6 +420,12 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
       return;
 
    hk_device_quiesce_lost_submissions(dev);
+
+   if (track_sparse_buffer(dev, buffer)) {
+      simple_mtx_lock(&dev->sparse_buffers_lock);
+      list_del(&buffer->sparse_link);
+      simple_mtx_unlock(&dev->sparse_buffers_lock);
+   }
 
    if (hk_buffer_in_physical_sparse_map(dev, buffer))
       hk_update_physical_sparse_map(dev, buffer->va->addr,

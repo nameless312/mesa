@@ -29,6 +29,21 @@ binding_has_immutable_samplers(const VkDescriptorSetLayoutBinding *binding)
    }
 }
 
+/* Converted immutable samplers reserve one native record per image plane. */
+static unsigned
+binding_plane_count(const VkDescriptorSetLayoutBinding *binding)
+{
+   unsigned planes = 1;
+   if (binding_has_immutable_samplers(binding)) {
+      for (uint32_t i = 0; i < binding->descriptorCount; i++) {
+         VK_FROM_HANDLE(hk_sampler, sampler, binding->pImmutableSamplers[i]);
+         if (sampler->vk.ycbcr_conversion)
+            planes = MAX2(planes, vk_format_get_plane_count(sampler->ycbcr.format));
+      }
+   }
+   return planes;
+}
+
 void
 hk_descriptor_stride_align_for_type(
    const struct hk_physical_device *pdev, VkDescriptorType type,
@@ -122,7 +137,7 @@ hk_descriptor_stride_align_for_type(
             *stride = *alignment =
                hk_sampled_image_descriptor_layout(generation).stride;
          } else {
-            *stride = HK_MAX_DESCRIPTOR_SIZE;
+            *stride = HK_MAX_NATIVE_DESCRIPTOR_SIZE;
             *alignment = (agx_native_graphics(&pdev->dev) ||
                           agx_chip_g17_m5(pdev->dev.chip))
                             ? HK_G17P_STORAGE_ALIGNMENT
@@ -148,7 +163,7 @@ hk_descriptor_stride_align_for_type(
       UNREACHABLE("Invalid descriptor type");
    }
 
-   assert(*stride <= HK_MAX_DESCRIPTOR_SIZE);
+   assert(*stride <= HK_MAX_NATIVE_DESCRIPTOR_SIZE);
 }
 
 void
@@ -179,6 +194,11 @@ hk_descriptor_stride_align_for_layout(
       }
       *stride = max_stride;
    }
+
+   /* Match the stride vkd3d uses to index descriptor buffers on G17C. */
+   if ((flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) &&
+       pdev->dev.chip == AGX_CHIP_G17C && *stride)
+      *stride = util_next_power_of_two(*stride);
 }
 
 uint32_t
@@ -187,7 +207,9 @@ hk_descriptor_buffer_size(const struct agx_device *dev, VkDescriptorType type)
    const struct hk_physical_device *pdev =
       container_of(dev, struct hk_physical_device, dev);
    uint32_t stride, alignment;
-   hk_descriptor_stride_align_for_type(pdev, type, NULL, &stride, &alignment);
+   hk_descriptor_stride_align_for_layout(
+      pdev, VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT,
+      type, NULL, &stride, &alignment);
    return stride;
 }
 
@@ -359,28 +381,15 @@ hk_CreateDescriptorSetLayout(VkDevice device,
                                             binding->descriptorType,
                                             type_list, &stride, &alignment);
 
-      uint8_t max_plane_count = 1;
-
       if (binding_has_immutable_samplers(binding)) {
          layout->binding[b].immutable_samplers = samplers;
-         samplers += binding->descriptorCount;
-         for (uint32_t i = 0; i < binding->descriptorCount; i++) {
-            VK_FROM_HANDLE(hk_sampler, sampler, binding->pImmutableSamplers[i]);
-            layout->binding[b].immutable_samplers[i] = sampler;
-            const uint8_t sampler_plane_count =
-               sampler->vk.ycbcr_conversion
-                  ? vk_format_get_plane_count(
-                       sampler->vk.ycbcr_conversion->state.format)
-                  : 1;
-            if (max_plane_count < sampler_plane_count)
-               max_plane_count = sampler_plane_count;
-         }
+         for (uint32_t i = 0; i < binding->descriptorCount; i++)
+            *samplers++ = hk_sampler_from_handle(binding->pImmutableSamplers[i]);
       }
-
-      stride *= max_plane_count;
+      stride *= binding_plane_count(binding);
 
       if (stride > 0) {
-         assert(stride <= UINT8_MAX);
+         assert(stride <= UINT16_MAX);
          assert(util_is_power_of_two_nonzero(alignment));
 
          buffer_size = align64(buffer_size, alignment);
@@ -469,7 +478,7 @@ hk_GetDescriptorSetLayoutSupport(
    uint32_t variable_stride = 0;
    uint32_t variable_count = 0;
    bool variable_is_inline_uniform_block = false;
-   uint8_t dynamic_buffer_count = 0;
+   uint64_t dynamic_buffer_count = 0;
 
    for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[i];
@@ -489,8 +498,10 @@ hk_GetDescriptorSetLayoutSupport(
                                             binding->descriptorType,
                                             type_list, &stride, &alignment);
 
+      stride *= binding_plane_count(binding);
+
       if (stride > 0) {
-         assert(stride <= UINT8_MAX);
+         assert(stride <= UINT16_MAX);
          assert(util_is_power_of_two_nonzero(alignment));
 
          if (flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) {
@@ -511,7 +522,7 @@ hk_GetDescriptorSetLayoutSupport(
              * check for whether or not the max buffer size is big enough, we
              * keep non_variable_size aligned to max_align.
              */
-            non_variable_size += stride * binding->descriptorCount;
+            non_variable_size += (uint64_t)stride * binding->descriptorCount;
             non_variable_size = align64(non_variable_size, max_align);
          }
       }
@@ -519,7 +530,7 @@ hk_GetDescriptorSetLayoutSupport(
 
    uint64_t buffer_size = non_variable_size;
    if (variable_stride > 0) {
-      buffer_size += variable_stride * variable_count;
+      buffer_size += (uint64_t)variable_stride * variable_count;
       buffer_size = align64(buffer_size, max_align);
    }
 
@@ -539,7 +550,7 @@ hk_GetDescriptorSetLayoutSupport(
          VkDescriptorSetVariableDescriptorCountLayoutSupport *vs = ext;
          uint32_t max_var_count;
 
-         if (variable_stride > 0) {
+         if (variable_stride > 0 && non_variable_size < max_buffer_size) {
             max_var_count =
                (max_buffer_size - non_variable_size) / variable_stride;
          } else {
