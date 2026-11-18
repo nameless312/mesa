@@ -346,3 +346,65 @@ TEST(M5MergeWords, FourWords)
    ralloc_free(b.shader);
 }
 
+/* Byte reads at X, X + 1 and X + 2 that execute together share X. */
+TEST(M5FoldOffsets, ByteSiblings)
+{
+   nir_builder b = compute_shader("byte-siblings");
+   nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_def *sum = nir_imm_int(&b, 0);
+   for (unsigned k = 0; k < 3; ++k) {
+      nir_def *v = nir_load_global(&b, 1, 8, buffer_address(&b, nir_iadd_imm(&b, x, k)),
+                                   .align_mul = 1);
+      sum = nir_iadd(&b, sum, nir_u2u32(&b, v));
+   }
+   nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader));
+   nir_validate_shader(b.shader, "byte siblings");
+   nir_def *index = NULL;
+   for (unsigned k = 0; k < 3; ++k) {
+      nir_intrinsic_instr *load = first_intrinsic(b.shader, nir_intrinsic_load_agx, k);
+      ASSERT_NE(load, nullptr);
+      EXPECT_EQ(nir_intrinsic_base(load) >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT, k);
+      EXPECT_FALSE(nir_intrinsic_sign_extend(load));
+      if (index)
+         EXPECT_EQ(load->src[1].ssa, index);
+      index = load->src[1].ssa;
+   }
+   ralloc_free(b.shader);
+}
+
+/* A lone byte read at X + 1 cannot prove X + 1 does not wrap: unchanged. */
+TEST(M5FoldOffsets, LoneByteKept)
+{
+   nir_builder b = compute_shader("lone-byte");
+   nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_def *v = nir_load_global(&b, 1, 8, buffer_address(&b, nir_iadd_imm(&b, x, 1)),
+                                .align_mul = 1);
+   nir_store_global(&b, nir_u2u32(&b, v), buffer_address(&b, nir_imm_int(&b, 64)),
+                    .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader));
+   ralloc_free(b.shader);
+}
+
+/* buf[i + 3] of 32-bit elements indexes with i and a 12-byte offset. */
+TEST(M5FoldOffsets, ArrayElement)
+{
+   nir_builder b = compute_shader("array-element");
+   nir_def *i = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_def *v = nir_load_global(&b, 1, 32,
+                                buffer_address(&b, nir_amul_imm(&b, nir_iadd_imm(&b, i, 3), 4)),
+                                .align_mul = 4);
+   nir_store_global(&b, v, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader));
+   nir_validate_shader(b.shader, "array element");
+   nir_intrinsic_instr *load = first_intrinsic(b.shader, nir_intrinsic_load_agx, 0);
+   ASSERT_NE(load, nullptr);
+   EXPECT_EQ(load->src[1].ssa, i);
+   EXPECT_EQ(nir_intrinsic_base(load) >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT, 12u);
+   EXPECT_TRUE(nir_intrinsic_sign_extend(load));
+   ralloc_free(b.shader);
+}
+
