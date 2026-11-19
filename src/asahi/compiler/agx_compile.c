@@ -10446,8 +10446,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (m5 && !g18_scans && !soft_fault &&
        debug_get_bool_option("ASAHI_M5_MERGE_GLOBAL_WORDS", true)) {
       bool merged = false;
+      /* Bytes stay separate by default: on M5 the Stereo SAD ran 14%
+       * slower with its byte reads merged (2.78 -> 3.20 ms per dispatch
+       * set), the unpack shifts costing more than the loads they save. */
       NIR_PASS(merged, nir, agx_nir_merge_global_words,
-               debug_get_bool_option("ASAHI_M5_MERGE_GLOBAL_BYTES", true));
+               debug_get_bool_option("ASAHI_M5_MERGE_GLOBAL_BYTES", false));
       if (merged) {
          NIR_PASS(_, nir, nir_opt_algebraic);
          NIR_PASS(_, nir, nir_opt_cse);
