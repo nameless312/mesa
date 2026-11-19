@@ -166,6 +166,39 @@ rematerialize(nir_builder *b, nir_def *def, nir_loop *loop,
    return result;
 }
 
+/* Operations whose result depends on which invocations run them together:
+ * subgroup and quad operations, and the AGX forms the subgroup lowering has
+ * already produced before this pass (elect, the active-lane count, quad
+ * ballots), plus the AGX operations that act for the whole SIMD-group or
+ * workgroup (ray traversal and its shared state, mesh payload barriers,
+ * sample-mask demotes). A main loop and a remainder run by different
+ * invocations at once would change them. */
+static bool
+lane_dependent(const nir_intrinsic_instr *intr)
+{
+   if (nir_intrinsic_infos[intr->intrinsic].flags &
+       (NIR_INTRINSIC_SUBGROUP | NIR_INTRINSIC_QUADGROUP))
+      return true;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_active_subgroup_invocation_agx:
+   case nir_intrinsic_load_active_subgroup_count_agx:
+   case nir_intrinsic_quad_ballot_agx:
+   case nir_intrinsic_is_helper_invocation:
+   case nir_intrinsic_load_helper_invocation:
+   case nir_intrinsic_demote_samples:
+   case nir_intrinsic_intersect_ray_agx:
+   case nir_intrinsic_continue_ray_agx:
+   case nir_intrinsic_load_scs_uniform_agx:
+   case nir_intrinsic_store_scs_uniform_agx:
+   case nir_intrinsic_mesh_payload_entry_barrier_agx:
+   case nir_intrinsic_object_payload_exit_barrier_agx:
+   case nir_intrinsic_fence_mesh_uvb_agx:
+      return true;
+   default:
+      return false;
+   }
+}
+
 /* Everything in the loop that is safe to execute F times in a row per
  * main-loop iteration. Returns the number of instructions, or -1. */
 static int
@@ -182,8 +215,7 @@ count_unrollable(nir_loop *loop, nir_if *terminator)
             break;
          case nir_instr_type_intrinsic: {
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            const nir_intrinsic_info *info = &nir_intrinsic_infos[intr->intrinsic];
-            if (info->flags & (NIR_INTRINSIC_SUBGROUP | NIR_INTRINSIC_QUADGROUP))
+            if (lane_dependent(intr))
                return -1;
             switch (intr->intrinsic) {
             case nir_intrinsic_barrier:

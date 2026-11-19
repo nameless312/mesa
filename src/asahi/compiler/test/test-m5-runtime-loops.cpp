@@ -117,6 +117,74 @@ TEST(M5RuntimeLoops, BarrierRefused)
    ralloc_free(s);
 }
 
+/* for (i = 0; i < n; i++) acc += op, with op what the M5 subgroup lowering
+ * leaves of subgroupElect() (active-lane index == 0), of
+ * subgroupBallotBitCount(subgroupBallot(true)) (the active-lane count), or of
+ * subgroupQuadAny() (a quad ballot), or, as a control, a plain compare. */
+enum lane_op { LANE_NONE, LANE_ELECT, LANE_BALLOT_COUNT, LANE_QUAD_VOTE };
+
+static nir_shader *
+lane_state_loop(lane_op op)
+{
+   nir_builder b = compute_shader("lane-state-loop");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 32);
+   nir_def *lane_id = nir_load_local_invocation_index(&b);
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_uge(&b, i, n));
+      nir_def *cond = nir_ult(&b, i, lane_id);
+      nir_def *v = NULL;
+      switch (op) {
+      case LANE_NONE:
+         v = nir_b2i32(&b, cond);
+         break;
+      case LANE_ELECT:
+         v = nir_b2i32(&b, nir_ieq_imm(&b, nir_load_active_subgroup_invocation_agx(&b, 16), 0));
+         break;
+      case LANE_BALLOT_COUNT:
+         v = nir_load_active_subgroup_count_agx(&b, 32);
+         break;
+      case LANE_QUAD_VOTE:
+         v = nir_b2i32(&b, nir_ine_imm(&b, nir_quad_ballot_agx(&b, 16, cond), 0));
+         break;
+      }
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, loop);
+   nir_store_global(&b, nir_load_var(&b, acc), buffer_address(&b, nir_imm_int(&b, 0)),
+                    .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   nir_validate_shader(b.shader, "lane-state loop before");
+   return b.shader;
+}
+
+/* These intrinsics carry no subgroup flag, but their result depends on which
+ * invocations run them together: a main loop and a remainder run by
+ * different lanes at once would elect once in each, or count and vote over
+ * only part of the lanes. The loop is left alone; the control unrolls. */
+TEST(M5RuntimeLoops, LaneStateRefused)
+{
+   nir_shader *s = lane_state_loop(LANE_NONE);
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256));
+   nir_validate_shader(s, "lane-state control after");
+   EXPECT_EQ(count_loops(s), 2u);
+   ralloc_free(s);
+
+   for (lane_op op : {LANE_ELECT, LANE_BALLOT_COUNT, LANE_QUAD_VOTE}) {
+      s = lane_state_loop(op);
+      EXPECT_FALSE(agx_nir_unroll_runtime_loops(s, 4, 256)) << "op " << op;
+      EXPECT_EQ(count_loops(s), 1u) << "op " << op;
+      ralloc_free(s);
+   }
+}
+
 TEST(M5RuntimeLoops, BudgetRefused)
 {
    nir_def *hi;
