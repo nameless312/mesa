@@ -10382,7 +10382,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool g18_scans,
                  uint16_t *preamble_size, uint8_t *ts_count, uint8_t *ss_count,
                  const struct agx_shader_key *dma_key,
-                 struct agx_shader_info *dma_info)
+                 struct agx_shader_info *dma_info, unsigned m5_unroll_factor,
+                 unsigned *m5_unroll_widest)
 {
    /* This runs only once up front since other optimizations don't affect it */
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
@@ -10399,14 +10400,20 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, m5, g17p);
    }
 
-   /* Counted loops whose trip count is only known at run time: run four
+   /* Counted loops whose trip count is only known at run time: run several
     * iterations per loop test where the bound allows it. On M5 the loop
     * control of a short body costs about as much as the body, and the
-    * unrolled body's loads issue together and vectorize below. */
+    * unrolled body's loads issue together and vectorize below. Bodies of up
+    * to 40 instructions run 8 iterations per test (Metal's compiler unrolls
+    * such loops by 8 when the source asks for it, as Geekbench's Hamming
+    * distance does; SPIR-V carries no such hint), up to 80 run 4, up to 160
+    * run 2. agx_compile_shader_nir compiles again with 4 if 8 costs
+    * occupancy. */
    if (m5 && !g18_scans &&
        debug_get_bool_option("ASAHI_M5_UNROLL_RUNTIME_LOOPS", true)) {
       bool unrolled = false;
-      NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, 4, 320);
+      NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, m5_unroll_factor,
+               320, m5_unroll_widest);
       if (unrolled)
          agx_optimize_loop_nir(nir, m5, g17p);
    }
@@ -16107,9 +16114,11 @@ g17p_cse_shared_reads_in_phases(nir_shader *nir)
    return any;
 }
 
-bool
-agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
-                       struct agx_shader_part *out)
+static bool
+agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
+                            struct agx_shader_part *out,
+                            unsigned m5_unroll_factor,
+                            unsigned *m5_unroll_widest)
 {
    /* Specialization or shader linking may gather info again after
     * preprocessing, clearing the operation-derived helper flags. Execution
@@ -16401,7 +16410,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                                               : NULL,
       (form_preamble && key->promote_textures) ? &info->sampler_state_count
                                               : NULL,
-      form_preamble ? key : NULL, info);
+      form_preamble ? key : NULL, info, m5_unroll_factor, m5_unroll_widest);
 
    /* Safe uniform-load speculation and if/phi folding have now exposed
     * matching sample copies. Preserve early subset proofs through those
@@ -16724,6 +16733,51 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    out->binary = binary.data;
    info->binary_size = binary.size;
    return true;
+}
+
+/* M5 unrolls short run-time-counted loops by up to 8 (see agx_optimize_nir).
+ * More iterations per test never pays for fewer resident threads: when the
+ * wider unroll leaves the shader below the occupancy of a register-light
+ * program, compile it again unrolled by at most 4. */
+bool
+agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
+                       struct agx_shader_part *out)
+{
+   unsigned factor = debug_get_num_option("ASAHI_M5_UNROLL_FACTOR", 8);
+   factor = factor >= 16 ? 16 : factor >= 8 ? 8 : factor >= 4 ? 4 : 2;
+
+   const bool m5 = key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+                   !key->dev.emit_agx3d && !agx_is_g18g(&key->dev);
+   if (!m5 || factor <= 4)
+      return agx_compile_shader_nir_once(nir, key, out, factor, NULL);
+
+   nir_shader *clone = nir_shader_clone(NULL, nir);
+   const struct agx_shader_key saved_key = *key;
+   unsigned widest = 0;
+   bool ok = agx_compile_shader_nir_once(nir, key, out, factor, &widest);
+   const unsigned full = agx_occupancy_for_register_count(0).max_threads;
+   const unsigned first =
+      ok ? agx_occupancy_for_register_count(out->info.nr_gprs).max_threads : 0;
+   /* Also when the wider unroll did not compile at all. */
+   if (widest > 4 && first < full) {
+      struct agx_shader_part narrow = {0};
+      *key = saved_key;
+      if (agx_compile_shader_nir_once(clone, key, &narrow, 4, NULL) &&
+          agx_occupancy_for_register_count(narrow.info.nr_gprs).max_threads >
+             first) {
+         if (ok)
+            free(out->binary);
+         *out = narrow;
+         ok = true;
+      } else {
+         /* Keep the first result. */
+         if (narrow.binary && narrow.binary != out->binary)
+            free(narrow.binary);
+         *key = saved_key;
+      }
+   }
+   ralloc_free(clone);
+   return ok;
 }
 
 void
