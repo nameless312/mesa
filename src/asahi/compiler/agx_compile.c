@@ -16555,6 +16555,13 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
                nir_metadata_control_flow, NULL);
    }
 
+   /* A workgroup of one subgroup needs only SIMD-group fences. (Runs after
+    * any pass that delimits shared-memory phases by workgroup barriers.) */
+   if (key->dev.chip == AGX_CHIP_G17S &&
+       key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       debug_get_bool_option("ASAHI_M5_SINGLE_SUBGROUP_BARRIERS", true))
+      NIR_PASS(_, nir, agx_nir_narrow_single_subgroup_barriers);
+
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       nir_print_shader(nir, stdout);
 
