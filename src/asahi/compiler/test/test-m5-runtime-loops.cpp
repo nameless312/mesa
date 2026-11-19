@@ -336,13 +336,59 @@ TEST(M5MergeWords, FourWords)
    }
    nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
    NIR_PASS(_, b.shader, nir_opt_cse);
-   EXPECT_TRUE(agx_nir_merge_global_words(b.shader));
+   EXPECT_TRUE(agx_nir_merge_global_words(b.shader, true));
    NIR_PASS(_, b.shader, nir_opt_dce);
    nir_validate_shader(b.shader, "merge words");
    nir_intrinsic_instr *load = first_intrinsic(b.shader, nir_intrinsic_load_global, 0);
    ASSERT_NE(load, nullptr);
    EXPECT_EQ(load->def.num_components, 4u);
    EXPECT_EQ(first_intrinsic(b.shader, nir_intrinsic_load_global, 1), nullptr);
+   ralloc_free(b.shader);
+}
+
+/* Bytes X + 1 .. X + 4 become one u8x4 load at X + 1 when bytes are enabled;
+ * a byte at X + 6 stays alone; nothing merges with bytes disabled. */
+static nir_builder
+byte_reads(void)
+{
+   nir_builder b = compute_shader("merge-bytes");
+   nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_def *sum = nir_imm_int(&b, 0);
+   static const unsigned offs[] = {3, 1, 6, 4, 2};
+   for (unsigned k = 0; k < ARRAY_SIZE(offs); ++k) {
+      nir_def *v = nir_load_global(&b, 1, 8,
+                                   buffer_address(&b, nir_iadd_imm(&b, x, offs[k])),
+                                   .align_mul = 1);
+      sum = nir_iadd(&b, nir_imul_imm(&b, sum, 3), nir_u2u32(&b, v));
+   }
+   nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   return b;
+}
+
+TEST(M5MergeWords, FourBytes)
+{
+   nir_builder b = byte_reads();
+   EXPECT_TRUE(agx_nir_merge_global_words(b.shader, true));
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   nir_validate_shader(b.shader, "merge bytes");
+   nir_intrinsic_instr *vec = NULL, *lone = NULL;
+   for (unsigned k = 0; k < 2; ++k) {
+      nir_intrinsic_instr *load = first_intrinsic(b.shader, nir_intrinsic_load_global, k);
+      ASSERT_NE(load, nullptr);
+      EXPECT_EQ(load->def.bit_size, 8u);
+      (load->def.num_components == 4 ? vec : lone) = load;
+   }
+   EXPECT_EQ(first_intrinsic(b.shader, nir_intrinsic_load_global, 2), nullptr);
+   ASSERT_NE(vec, nullptr);
+   ASSERT_NE(lone, nullptr);
+   EXPECT_EQ(lone->def.num_components, 1u);
+   /* The vector starts at X + 1 and sits where X + 3 was read, the first. */
+   EXPECT_EQ(first_intrinsic(b.shader, nir_intrinsic_load_global, 0), vec);
+   ralloc_free(b.shader);
+
+   b = byte_reads();
+   EXPECT_FALSE(agx_nir_merge_global_words(b.shader, false));
    ralloc_free(b.shader);
 }
 

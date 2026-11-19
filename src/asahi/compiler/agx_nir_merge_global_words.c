@@ -4,11 +4,13 @@
  */
 
 /*
- * Merge reads of consecutive 32-bit words of one buffer into vector loads.
+ * Merge reads of consecutive 32-bit words, or of consecutive bytes, of one
+ * buffer into vector loads (u32x2..4, u8x2..4: the loads Metal's compiler
+ * emits for the same kernels on M5).
  *
  * Buffer reads address base + u2u64(X + c) with a 32-bit offset X + c. Two
- * such reads of words c and c + 4 are adjacent in memory unless X + c wraps
- * 2^32 between them; such an offset lies past the end of any buffer, so a
+ * such reads of elements c and c + size are adjacent in memory unless X + c
+ * wraps 2^32 between them; such an offset lies past the end of any buffer, so a
  * shader that executes both reads has undefined behaviour whenever they are
  * not adjacent. nir_opt_load_store_vectorize cannot use that argument, since
  * it does not know that every read it merges executes: it asks for a proof
@@ -72,6 +74,7 @@ read_cmp(const void *pa, const void *pb)
    if ((u) != (v))                                                            \
       return (u) < (v) ? -1 : 1
    CMP(a->load->intrinsic, b->load->intrinsic);
+   CMP(a->load->def.bit_size, b->load->def.bit_size);
    CMP(a->base->index, b->base->index);
    CMP(nir_intrinsic_access(a->load), nir_intrinsic_access(b->load));
    int t = lin_cmp_terms(&a->offset, &b->offset);
@@ -87,6 +90,7 @@ static bool
 same_record(const struct word_read *a, const struct word_read *b)
 {
    return a->load->intrinsic == b->load->intrinsic && a->base == b->base &&
+          a->load->def.bit_size == b->load->def.bit_size &&
           nir_intrinsic_access(a->load) == nir_intrinsic_access(b->load) &&
           !lin_cmp_terms(&a->offset, &b->offset);
 }
@@ -120,7 +124,7 @@ all_execute(nir_instr *first, nir_instr *last, bool reorderable)
 }
 
 static bool
-merge_block(nir_block *block, struct util_dynarray *reads)
+merge_block(nir_block *block, struct util_dynarray *reads, bool bytes)
 {
    util_dynarray_clear(reads);
    nir_foreach_instr(instr, block) {
@@ -129,10 +133,12 @@ merge_block(nir_block *block, struct util_dynarray *reads)
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
       if ((in->intrinsic != nir_intrinsic_load_global &&
            in->intrinsic != nir_intrinsic_load_global_constant) ||
-          in->num_components != 1 || in->def.bit_size != 32 ||
+          in->num_components != 1 ||
           (nir_intrinsic_access(in) &
-           (ACCESS_VOLATILE | ACCESS_COHERENT | ACCESS_CAN_SPECULATE)) ||
-          nir_intrinsic_align(in) < 4)
+           (ACCESS_VOLATILE | ACCESS_COHERENT | ACCESS_CAN_SPECULATE)))
+         continue;
+      if (!(in->def.bit_size == 32 && nir_intrinsic_align(in) >= 4) &&
+          !(in->def.bit_size == 8 && bytes))
          continue;
 
       struct word_read r = {.load = in};
@@ -155,10 +161,11 @@ merge_block(nir_block *block, struct util_dynarray *reads)
 
    bool progress = false;
    for (unsigned i = 0; i < n;) {
+      const unsigned bit_size = r[i].load->def.bit_size;
       unsigned count = 1;
       while (i + count < n && count < 4 && same_record(&r[i], &r[i + count]) &&
              r[i + count].offset.constant ==
-                r[i + count - 1].offset.constant + 4)
+                r[i + count - 1].offset.constant + bit_size / 8)
          count++;
 
       if (count < 2) {
@@ -186,14 +193,22 @@ merge_block(nir_block *block, struct util_dynarray *reads)
                                 (uint32_t)(r[i].offset.constant -
                                            r[first].offset.constant));
       nir_def *addr = nir_iadd(&b, r[i].base, nir_u2u64(&b, x));
+      /* The lowest element's alignment is the vector's. */
       nir_intrinsic_instr *proto = r[i].load;
+      const unsigned align_mul =
+         bit_size == 32 ? 4 : nir_intrinsic_align_mul(proto);
+      const unsigned align_offset =
+         bit_size == 32 ? 0 : nir_intrinsic_align_offset(proto);
       nir_def *vec;
       if (proto->intrinsic == nir_intrinsic_load_global_constant)
-         vec = nir_load_global_constant(&b, count, 32, addr,
-                                        .align_mul = 4,
+         vec = nir_load_global_constant(&b, count, bit_size, addr,
+                                        .align_mul = align_mul,
+                                        .align_offset = align_offset,
                                         .access = nir_intrinsic_access(proto));
       else
-         vec = nir_load_global(&b, count, 32, addr, .align_mul = 4,
+         vec = nir_load_global(&b, count, bit_size, addr,
+                               .align_mul = align_mul,
+                               .align_offset = align_offset,
                                .access = nir_intrinsic_access(proto));
 
       for (unsigned j = 0; j < count; j++) {
@@ -206,7 +221,7 @@ merge_block(nir_block *block, struct util_dynarray *reads)
 }
 
 bool
-agx_nir_merge_global_words(nir_shader *shader)
+agx_nir_merge_global_words(nir_shader *shader, bool bytes)
 {
    bool any = false;
    struct util_dynarray reads;
@@ -217,7 +232,7 @@ agx_nir_merge_global_words(nir_shader *shader)
       nir_index_instrs(impl);
       bool progress = false;
       nir_foreach_block(block, impl)
-         progress |= merge_block(block, &reads);
+         progress |= merge_block(block, &reads, bytes);
       any |= nir_progress(progress, impl, nir_metadata_control_flow);
    }
 
