@@ -3136,8 +3136,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    const bool lower_g17p_robust_images =
       dev->dev.chip == AGX_CHIP_G17P &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+   /* G17C enforces robust texelFetch view bounds and missing-alpha one in
+    * hardware (with 32-bit array layers saturated to 16 bits in
+    * agx_nir_lower_texture.c and out-of-range LODs folded to x=0xFFF0). */
    const bool lower_agx3_robust_fetches =
-      (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
+      (dev->dev.chip == AGX_CHIP_G17P ||
+       (agx_chip_g17_m5(dev->dev.chip) && dev->dev.chip != AGX_CHIP_G17C)) &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    const bool native_robust_images =
       agx_chip_explicit_robust_image_bounds(dev->dev.chip) &&
@@ -3459,8 +3463,11 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       /* hk_nir_lower_robust_image_access() leaves formatless loads to this
        * pass. */
-      NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata,
-               agx_chip_descriptor_generation(dev->dev.chip),
+      unsigned tex_gen = agx_chip_descriptor_generation(dev->dev.chip);
+      if (dev->dev.chip == AGX_CHIP_G17C &&
+          rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT)
+         tex_gen |= AGX_NIR_TEXTURE_HW_TXF_BOUNDS;
+      NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata, tex_gen,
                lower_agx3_robust_fetches, dev->dev.sparse_ro_offset,
                dev->vk.enabled_features.sparseResidencyBuffer);
    } else {
