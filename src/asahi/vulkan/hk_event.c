@@ -72,11 +72,44 @@ hk_GetEventStatus(VkDevice device, VkEvent _event)
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_SetEvent(VkDevice device, VkEvent _event)
 {
+   VK_FROM_HANDLE(hk_device, dev, device);
    VK_FROM_HANDLE(hk_event, event, _event);
 
+   mtx_lock(&dev->host_event.lock);
    *event->status = VK_EVENT_SET;
+   event->host_sets++;
+   cnd_broadcast(&dev->host_event.set);
+   mtx_unlock(&dev->host_event.lock);
 
    return VK_SUCCESS;
+}
+
+/* Whether the event is still reset. *sets is the count of host sets so far,
+ * for hk_event_wait_host_set(). */
+bool
+hk_event_host_unset(struct hk_device *dev, struct hk_event *event,
+                    uint32_t *sets)
+{
+   mtx_lock(&dev->host_event.lock);
+   *sets = event->host_sets;
+   const bool unset = *event->status != VK_EVENT_SET;
+   mtx_unlock(&dev->host_event.lock);
+   return unset;
+}
+
+/* Until the host sets the event after the sets counted. False if the device
+ * is being destroyed first. */
+bool
+hk_event_wait_host_set(struct hk_device *dev, struct hk_event *event,
+                       uint32_t sets)
+{
+   mtx_lock(&dev->host_event.lock);
+   while (!dev->host_event.stop && event->host_sets == sets &&
+          *event->status != VK_EVENT_SET)
+      cnd_wait(&dev->host_event.set, &dev->host_event.lock);
+   const bool set = !dev->host_event.stop;
+   mtx_unlock(&dev->host_event.lock);
+   return set;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -165,6 +198,24 @@ hk_event_wait_polls(const struct hk_device *dev)
    return dev->dev.chip == AGX_CHIP_G17P;
 }
 
+/* Whether the first synchronization scope is host operations alone. Only
+ * vkSetEvent sets the event then: a wait on a host-set event names only the
+ * host stage (VUID-vkCmdWaitEvents2-pEvents-03839), and vkCmdSetEvent2,
+ * whose scope the wait repeats, cannot name it. A legacy vkCmdWaitEvents
+ * mask that adds device stages for other events is not host-only. */
+static bool
+hk_dependency_host_only(const VkDependencyInfo *info)
+{
+   VkPipelineStageFlags2 src = 0;
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i)
+      src |= info->pMemoryBarriers[i].srcStageMask;
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i)
+      src |= info->pBufferMemoryBarriers[i].srcStageMask;
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i)
+      src |= info->pImageMemoryBarriers[i].srcStageMask;
+   return src == VK_PIPELINE_STAGE_2_HOST_BIT;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
                   const VkEvent *pEvents,
@@ -194,6 +245,14 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
       hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
 
       if (hk_event_wait_polls(dev)) {
+         /* A host-only wait polls in a stream of its own: the GPU does not
+          * see a host write made while a command runs, so submission holds
+          * that stream's command back until vkSetEvent
+          * (queue_submit_looped()). */
+         const bool host = hk_dependency_host_only(&pDependencyInfos[i]);
+         if (host)
+            hk_cmd_buffer_end_compute(cmd);
+
          cmd->sync.kind_override = HK_SYNC_ALL;
          struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
          if (cs)
@@ -205,6 +264,10 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
          /* Later work of the destination kinds runs after the poll. The
           * poll stream is ended so it cannot absorb that work. */
          cs = cmd->current_cs.cs ? cmd->current_cs.cs : cs;
+         if (host && cs) {
+            cs->host_wait = event;
+            cmd->host_waits++;
+         }
          hk_sync_after_stream(cmd, cs, dst_kinds);
          hk_cmd_buffer_end_compute(cmd);
       }

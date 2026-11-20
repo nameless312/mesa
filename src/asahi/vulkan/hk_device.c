@@ -1310,6 +1310,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    *pDevice = hk_device_to_handle(dev);
 
+   mtx_init(&dev->host_event.lock, mtx_plain);
+   cnd_init(&dev->host_event.set);
    simple_mtx_init(&dev->cmd_pending_lock, mtx_plain);
    list_inithead(&dev->cmd_pending_queues);
    list_inithead(&dev->cmd_pending_failed);
@@ -1405,6 +1407,12 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* Its thread and kicks use the queues and the device's kernels. */
    hk_compute_kick_stop(dev);
 
+   /* A submission still waiting for a vkSetEvent fails instead. */
+   mtx_lock(&dev->host_event.lock);
+   dev->host_event.stop = true;
+   cnd_broadcast(&dev->host_event.set);
+   mtx_unlock(&dev->host_event.lock);
+
    util_dynarray_fini(&dev->external_bos.counts);
    util_dynarray_fini(&dev->external_bos.list);
    u_rwlock_destroy(&dev->external_bos.lock);
@@ -1442,6 +1450,8 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
     * a new recording during teardown. Kernel job pins retain failed work. */
    hk_cmd_pending_finish(dev);
    simple_mtx_destroy(&dev->cmd_pending_lock);
+   cnd_destroy(&dev->host_event.set);
+   mtx_destroy(&dev->host_event.lock);
    hk_device_finish_vdm_slabs(dev);
    simple_mtx_destroy(&dev->vdm.lock);
 

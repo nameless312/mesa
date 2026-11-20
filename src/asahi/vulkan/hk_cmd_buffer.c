@@ -470,6 +470,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    cmd->geom_index_count = 0;
    cmd->geom_instance_count = 0;
    cmd->uses_heap = false;
+   cmd->host_waits = 0;
    hk_sync_reset(cmd);
    if (cmd->m5_pushed_images)
       _mesa_set_clear(cmd->m5_pushed_images, NULL);
@@ -935,7 +936,7 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
           !last->timestamp.end.handle &&
           !(last->timestamp.start.handle && cs->g17p_timestamp_query) &&
           !(last->timestamp.start.handle && cs->timestamp.start.handle) &&
-          !hk_sync_merge_delays(cmd, last, cs)) {
+          !cs->host_wait && !hk_sync_merge_delays(cmd, last, cs)) {
 
          hk_sync_merge(cmd, last, cs);
          hk_cs_merge_cdm(last, cs);

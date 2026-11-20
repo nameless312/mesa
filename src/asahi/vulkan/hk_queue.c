@@ -26,6 +26,7 @@
 #include "hk_frame_anatomy.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
+#include "hk_event.h"
 #include "hk_drm_render_core.h"
 #include "hk_drm_prior_core.h"
 #include "hk_execution_allowance.h"
@@ -560,11 +561,36 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
    return VK_SUCCESS;
 }
 
+/* A host-only event wait whose event was reset when its submission was
+ * built: the hardware command its poll starts, sent after vkSetEvent. */
+struct hk_host_cut {
+   unsigned command;
+   struct hk_event *event;
+   uint32_t sets;
+};
+
+/* Whether a submission may wait on its submit thread for a host vkSetEvent
+ * (queue_submit_looped()). The wait must hold no lock an application thread
+ * takes: the runtime holds the queue lock around a submission to a shared
+ * or internally synchronized queue, and hk_queue_admit() takes it too. */
+static bool
+hk_queue_may_wait_host(struct hk_queue *queue)
+{
+   return !queue->vk.real_queue && !queue->vk.internally_synchronized &&
+          vk_device_supports_threaded_submit(queue->vk.base.device);
+}
+
 /*
  * The kernel/firmware jointly impose a limit on commands per submit ioctl, but
  * we can build up arbitrarily large command buffers. We handle this here by
  * looping the ioctl, submitting slices of the command buffers that are within
  * bounds.
+ *
+ * An ioctl also ends before each host cut, whose command is sent once the
+ * host has set its event: G17P loads do not see a host write made while their
+ * command runs, only one made before it starts, so a poll already running
+ * would never end. The kernel resolves its waits at submission, so waiting
+ * for a host signal there is not possible.
  */
 static VkResult
 queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
@@ -572,7 +598,8 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
                     unsigned ring_idx, const uint64_t prior_base[2],
                     bool chunk_timelines, uint64_t first_chunk_point,
                     struct hk_frame_anatomy_submit *anatomy,
-                    struct hk_cmd_pending *pending)
+                    struct hk_cmd_pending *pending,
+                    const struct hk_host_cut *cut, unsigned cut_count)
 {
    uint8_t *cmdbuf = (uint8_t *)(uintptr_t)submit->cmdbuf;
    uint32_t offs = 0;
@@ -590,11 +617,24 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
              chunk_signal->sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ &&
              chunk_signal->handle == queue->drm.syncobj);
 
+   const struct hk_host_cut *cut_end = cut + cut_count;
    while (commands_remaining) {
-      bool first = commands_remaining == command_count;
-      bool last = commands_remaining <= max_commands_per_submit(dev);
+      const unsigned at = command_count - commands_remaining;
+      if (cut != cut_end && cut->command == at) {
+         if (!hk_event_wait_host_set(dev, cut->event, cut->sets)) {
+            if (chunk_timelines)
+               queue->drm.timeline_value = last_attempted_point;
+            return vk_device_set_lost(
+               &dev->vk, "Device destroyed before a host-only event wait");
+         }
+         cut++;
+      }
 
+      bool first = commands_remaining == command_count;
       unsigned count = MIN2(commands_remaining, max_commands_per_submit(dev));
+      if (cut != cut_end)
+         count = MIN2(count, cut->command - at);
+      bool last = count == commands_remaining;
       commands_remaining -= count;
 
       assert(!last || commands_remaining == 0);
@@ -1410,7 +1450,7 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
 
       const bool rq_capable =
          dev->gen1_native_graphics_rq || dev->gen1_native_fragment_rq;
-      bool needs_queue = false;
+      bool needs_queue = false, host_waits = false;
       unsigned render_rq = 0;
       for (uint32_t i = 0; i < submitCount; i++) {
          for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
@@ -1419,12 +1459,24 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
             if (list_is_empty(&cmd->control_streams))
                continue;
             needs_queue = true;
+            host_waits |= cmd->host_waits != 0;
             if (rq_capable)
                render_rq |= hk_cmd_buffer_needs_render_rq(cmd);
          }
       }
       if (needs_queue) {
          VkResult result = hk_queue_admit(queue, render_rq);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+
+      /* A host-only event wait may hold its submission back until
+       * vkSetEvent (queue_submit_looped()), which only a submit thread can
+       * wait for. The queue keeps the thread, as for a wait before signal. */
+      if (host_waits &&
+          queue->vk.submit.mode != VK_QUEUE_SUBMIT_MODE_THREADED &&
+          hk_queue_may_wait_host(queue)) {
+         VkResult result = vk_queue_enable_submit_thread(&queue->vk);
          if (result != VK_SUCCESS)
             return result;
       }
@@ -1600,6 +1652,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    }
 
    unsigned command_count = flush_sstt ? 1 : 0;
+   unsigned host_waits = 0;
 
    /* Gather the number of individual commands to submit up front */
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
@@ -1607,7 +1660,14 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
          (struct hk_cmd_buffer *)submit->command_buffers[i];
 
       command_count += list_length(&cmdbuf->control_streams);
+      host_waits += cmdbuf->host_waits;
    }
+
+   /* On the submit thread hk_QueueSubmit2() started, each host-only event
+    * wait may end an ioctl (queue_submit_looped()). */
+   if (host_waits && (queue->vk.submit.mode != VK_QUEUE_SUBMIT_MODE_THREADED ||
+                      !hk_queue_may_wait_host(queue)))
+      host_waits = 0;
 
    perf_debug_dev(&dev->dev,
                   "Submitting %u control streams (%u command buffers)",
@@ -1913,7 +1973,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
    bool sib_earlier = false;
    if (queue->sib.count > 1 && !replaced && !flush_sstt && !unlikely(anatomy) &&
-       !packed_bo &&
+       !packed_bo && !host_waits &&
        hk_sibling_eligible(dev, queue, submit, resolved, prior_base,
                            command_count, kernel_cumulative) &&
        hk_sibling_deep(dev, queue, first_chunk_point - 1)) {
@@ -1937,6 +1997,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       kq_base[HK_SYNC_CDM] = queue->sib.submitted[sib_target][HK_SYNC_CDM];
    }
 
+   struct hk_host_cut *cuts =
+      host_waits ? alloca(host_waits * sizeof(*cuts)) : NULL;
+   unsigned cut_count = 0;
+
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
@@ -1955,6 +2019,18 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
          if (resolved)
             hk_sync_load_resolved(cs, resolved++);
+
+         /* A set event needs no cut: the poll starts after the set. */
+         uint32_t sets;
+         if (host_waits && cs->host_wait &&
+             hk_event_host_unset(dev, cs->host_wait, &sets)) {
+            cuts[cut_count++] = (struct hk_host_cut){
+               .command = nr_vdm + nr_cdm,
+               .event = cs->host_wait,
+               .sets = sets,
+            };
+         }
+
          struct drm_asahi_cmd_header header =
             agx_cmd_header(cs->type == HK_CS_CDM, cs->sync.barrier[HK_SYNC_VDM],
                            cs->sync.barrier[HK_SYNC_CDM]);
@@ -2348,7 +2424,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       hk_frame_anatomy_prepare(anatomy, dev, payload.data, payload.size);
 
    VkResult result;
-   if (command_count <= max_commands_per_submit(dev)) {
+   if (command_count <= max_commands_per_submit(dev) && !cut_count) {
       if (unlikely(anatomy))
          hk_frame_anatomy_note_barriers(anatomy, payload.data, 0, payload.size);
       result =
@@ -2357,7 +2433,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       result = queue_submit_looped(dev, queue, &submit_ioctl, command_count,
                                    queue->drm.virt_ring_idx, kq_base,
                                    chunk_timelines, first_chunk_point, anatomy,
-                                   pending);
+                                   pending, cuts, cut_count);
    }
    hk_cmd_pending_end(dev, pending, queue, result);
    if (queue->sib.count > 1 && result == VK_SUCCESS) {

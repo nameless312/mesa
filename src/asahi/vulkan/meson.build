@@ -1078,6 +1078,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  hk_vulkan_host_event_wait = executable(
+    'hk-vulkan-host-event-wait',
+    files('tests/hk_vulkan_host_event_wait.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_descriptor_buffer_sizes = executable(
     'hk-vulkan-descriptor-buffer-sizes',
     files('tests/hk_vulkan_descriptor_buffer_sizes.c'),

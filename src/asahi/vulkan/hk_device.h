@@ -353,6 +353,15 @@ struct hk_device {
       uint32_t next_size[HK_CMD_SLAB_COUNT];
    } vdm;
 
+   /* A host vkSetEvent wakes a submission waiting for it on a submit
+    * thread (hk_event_wait_host_set()); stop ends those waits when the
+    * device is destroyed, whose queues join their submit threads. */
+   struct {
+      mtx_t lock;
+      cnd_t set;
+      bool stop;
+   } host_event;
+
    bool cmd_pending_ready;
    simple_mtx_t cmd_pending_lock;
    /* Queues with pending submissions (hk_queue::cmd_link). */

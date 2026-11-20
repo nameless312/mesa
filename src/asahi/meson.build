@@ -300,6 +300,24 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     timeout : 120,
   )
 
+  # A host-only vkCmdWaitEvents2 starts its poll in an ioctl sent after
+  # vkSetEvent; a device-set event's wait stays in the one ioctl.
+  test(
+    'hk-g17p-host-event-wait',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      hk_vulkan_host_event_wait,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Explicit DRM plane layouts: placement, requirements, subresource layouts
   # and validation, without executing on the GPU.
   foreach chip : ['g13g', 'g17p']

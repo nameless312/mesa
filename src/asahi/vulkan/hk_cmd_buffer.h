@@ -1168,6 +1168,11 @@ struct hk_cs {
    bool gen1_native_vertex_rq;
    bool m5_matrix_ops;
 
+   /* The host-set event a host-only vkCmdWaitEvents2 polls for in this
+    * stream: the stream starts a command of its own (merge_control_streams),
+    * which submission sends after vkSetEvent. */
+   struct hk_event *host_wait;
+
    /* Threads of the application's direct dispatches in this stream, and
     * whether it holds an indirect one (hk_queue::sib only takes streams with
     * enough work to overlap). */
@@ -1874,6 +1879,9 @@ struct hk_cmd_buffer {
 
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;
+
+   /* Streams with hk_cs::host_wait. */
+   uint32_t host_waits;
 
    /* Owned BOs and retained references needed by recorded commands. */
    struct util_dynarray large_bos;
