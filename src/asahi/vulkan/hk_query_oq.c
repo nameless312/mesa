@@ -141,6 +141,19 @@ hk_drop_oq_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 /* Recording order: while an earlier stream is judged, later deferred streams
  * still wait on later renders, so only the last can ride on its render. */
 static void
+hk_move_oq_writes(struct hk_cs *dst, struct hk_cs *src)
+{
+   util_dynarray_append_dynarray(&dst->imm_writes, &src->imm_writes);
+   if (src->imm_write_query_untracked)
+      dst->imm_write_query_untracked = true;
+   util_dynarray_foreach(&src->imm_write_query_ranges,
+                         struct hk_query_access_range, r) {
+      hk_cs_note_imm_write_query_access(dst, r->handle, r->start_B,
+                                        r->end_B - r->start_B);
+   }
+}
+
+static void
 hk_resolve_oq_forward(struct hk_cmd_buffer *cmd)
 {
    struct hk_cs *movable = NULL;
@@ -162,7 +175,7 @@ hk_resolve_oq_forward(struct hk_cmd_buffer *cmd)
             movable = NULL;
          }
          if (movable) {
-            util_dynarray_append_dynarray(&cs->imm_writes, &movable->imm_writes);
+            hk_move_oq_writes(cs, movable);
             hk_drop_oq_stream(cmd, movable);
          }
          movable = cs;
@@ -233,7 +246,7 @@ hk_resolve_oq_reverse(struct hk_cmd_buffer *cmd)
 
       cs->oq_avail_deferred = false;
       if (movable && hk_oq_joins(cmd, cs, movable)) {
-         util_dynarray_append_dynarray(&movable->imm_writes, &cs->imm_writes);
+         hk_move_oq_writes(movable, cs);
          hk_drop_oq_stream(cmd, cs);
          continue;
       }
@@ -246,7 +259,7 @@ hk_resolve_oq_reverse(struct hk_cmd_buffer *cmd)
          /* The later stream's render wait covers this stream's render. */
          if (movable && movable->sync.dep[HK_SYNC_VDM].cut->sync.seq >=
                            cs->sync.dep[HK_SYNC_VDM].cut->sync.seq) {
-            util_dynarray_append_dynarray(&movable->imm_writes, &cs->imm_writes);
+            hk_move_oq_writes(movable, cs);
             hk_drop_oq_stream(cmd, cs);
             break;
          }
